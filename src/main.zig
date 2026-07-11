@@ -13,6 +13,8 @@ const nostr = @import("nostr");
 const serve = @import("serve.zig");
 const keystore = @import("keystore.zig");
 const policy = @import("policy.zig");
+const approval = @import("approval.zig");
+const approval_http = @import("approval_http.zig");
 
 const keys = nostr.keys;
 const nip46 = nostr.nip46;
@@ -85,15 +87,50 @@ pub fn main() !void {
     const pk_hex = try hex.encode(gpa, &kp.public_key);
     defer gpa.free(pk_hex);
 
+    // Interactive (GUI) mode: when SIGNER_APPROVAL_HTTP is set, stand up the
+    // loopback approval API and hand every relay thread a broker so requests are
+    // held for the GUI instead of auto-approved. The broker/server live in this
+    // frame (which never returns — the threads are joined below), so their
+    // addresses are stable for the lifetime of the process.
+    var broker_storage: approval.Broker = .{};
+    var approval_server: approval_http.Server = undefined;
+    const broker_ptr: ?*approval.Broker = if (getEnv("SIGNER_APPROVAL_HTTP")) |addr| blk: {
+        const token_path = getEnv("SIGNER_APPROVAL_TOKEN_FILE") orelse
+            fail("SIGNER_APPROVAL_HTTP requires SIGNER_APPROVAL_TOKEN_FILE (where to write the API token)");
+        const hp = parseHostPort(addr) orelse
+            fail("SIGNER_APPROVAL_HTTP must be host:port, e.g. 127.0.0.1:8787");
+        const token_hex = makeAndWriteToken(gpa, token_path);
+        approval_server = .{
+            .gpa = gpa,
+            .broker = &broker_storage,
+            .token = token_hex,
+            .info = .{ .pubkey_hex = pk_hex, .relays = relays.items, .timeout_ms = broker_storage.timeout_ms },
+            .host = hp.host,
+            .port = hp.port,
+        };
+        const server_thread = std.Thread.spawn(.{}, runApprovalServer, .{&approval_server}) catch
+            fail("could not start the approval server");
+        server_thread.detach();
+        std.debug.print("signer: approval API on http://{s} (bearer token written to {s})\n", .{ addr, token_path });
+        break :blk &broker_storage;
+    } else null;
+
+    const approval_note = if (broker_ptr != null)
+        "held until you approve them in the connected GUI"
+    else if (conn_secret == null)
+        "auto-approved (no connection secret set)"
+    else
+        "auto-approved behind the connection secret";
+
     std.debug.print(
         \\zig-nostr signer (headless)
         \\  pubkey : {s}
         \\  bunker : {s}
         \\
         \\Share the bunker:// token with a client to connect. Requests are
-        \\auto-approved{s}. Press Ctrl-C to stop.
+        \\{s}. Press Ctrl-C to stop.
         \\
-    , .{ pk_hex, token, if (conn_secret == null) " (no connection secret set)" else "" });
+    , .{ pk_hex, token, approval_note });
 
     // Serve each relay on its own thread. Each thread owns its secp256k1
     // context and bunker, so nothing mutable is shared between them; the only
@@ -101,7 +138,7 @@ pub fn main() !void {
     var threads: std.ArrayList(std.Thread) = .empty;
     defer threads.deinit(gpa);
     for (relays.items) |url| {
-        const t = std.Thread.spawn(.{}, serveRelayForever, .{ gpa, url, secret_key, conn_secret, &policy_config }) catch |err| {
+        const t = std.Thread.spawn(.{}, serveRelayForever, .{ gpa, url, secret_key, conn_secret, &policy_config, broker_ptr }) catch |err| {
             std.debug.print("signer: [{s}] could not start: {s}\n", .{ url, @errorName(err) });
             continue;
         };
@@ -120,6 +157,7 @@ fn serveRelayForever(
     secret_key: [32]u8,
     conn_secret: ?[]const u8,
     policy_config: *const policy.Config,
+    broker: ?*approval.Broker,
 ) void {
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -132,7 +170,19 @@ fn serveRelayForever(
         return;
     };
 
-    var bunker = nip46.Bunker.initSingleKey(signer, kp, policy_config.policy());
+    // In GUI mode the interactive policy escalates to the broker (which blocks
+    // this thread until the GUI decides); otherwise the static allowlist policy
+    // decides. `interactive` lives for this forever-looping frame, so the policy
+    // may hold a pointer to it.
+    var interactive = approval.Interactive{
+        .broker = broker orelse undefined,
+        .config = policy_config,
+        .io = io,
+        .gpa = gpa,
+    };
+    const request_policy = if (broker != null) interactive.asPolicy() else policy_config.policy();
+
+    var bunker = nip46.Bunker.initSingleKey(signer, kp, request_policy);
     bunker.secret = conn_secret;
 
     while (true) {
@@ -283,6 +333,45 @@ fn buildPolicyConfig(gpa: std.mem.Allocator) policy.Config {
     return cfg;
 }
 
+const HostPort = struct { host: []const u8, port: u16 };
+
+/// Parses a `host:port` string (e.g. `127.0.0.1:8787`).
+fn parseHostPort(s: []const u8) ?HostPort {
+    const colon = std.mem.lastIndexOfScalar(u8, s, ':') orelse return null;
+    const host = s[0..colon];
+    if (host.len == 0) return null;
+    const port = std.fmt.parseInt(u16, s[colon + 1 ..], 10) catch return null;
+    return .{ .host = host, .port = port };
+}
+
+/// Generates a fresh random bearer token, writes it to `path` as a `0600` file
+/// (overwriting a stale one), and returns the hex token (owned, process-lived).
+fn makeAndWriteToken(gpa: std.mem.Allocator, path: []const u8) []u8 {
+    var startup = std.Io.Threaded.init(gpa, .{});
+    defer startup.deinit();
+    const io = startup.io();
+
+    var raw: [24]u8 = undefined;
+    io.randomSecure(&raw) catch |err| failFmt("could not generate an API token: {s}", .{@errorName(err)});
+    const token_hex = hex.encode(gpa, &raw) catch fail("out of memory generating the API token");
+
+    std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = path,
+        .data = token_hex,
+        .flags = .{ .truncate = true, .permissions = std.Io.File.Permissions.fromMode(0o600) },
+    }) catch |err| failFmt("could not write the token file '{s}': {s}", .{ path, @errorName(err) });
+    return token_hex;
+}
+
+/// Runs the approval HTTP server on its own thread with its own io.
+fn runApprovalServer(server: *approval_http.Server) void {
+    var threaded = std.Io.Threaded.init(server.gpa, .{});
+    defer threaded.deinit();
+    server.run(threaded.io()) catch |err| {
+        std.debug.print("signer: approval server stopped: {s}\n", .{@errorName(err)});
+    };
+}
+
 fn getEnv(name: [*:0]const u8) ?[]const u8 {
     const value = std.c.getenv(name) orelse return null;
     return std.mem.span(value);
@@ -306,6 +395,8 @@ test {
     _ = @import("serve.zig");
     _ = @import("keystore.zig");
     _ = @import("policy.zig");
+    _ = @import("approval.zig");
+    _ = @import("approval_http.zig");
 }
 
 test "derives the pubkey and builds a bunker token" {
