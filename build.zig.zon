@@ -5,8 +5,8 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .nostr = .{
-            .url = "https://github.com/zig-nostr/nostr/archive/refs/tags/v0.3.1.tar.gz",
-            .hash = "nostr-0.3.1-CMyPzZXFBQCiWBC_G1tU1wlaoN_V01USsHLLlmXb2i-5",
+            .url = "https://github.com/zig-nostr/nostr/archive/refs/tags/v0.3.2.tar.gz",
+            .hash = "nostr-0.3.2-CMyPzQrRBQCwYRw7tT5RBeYwpwbB5FXaQUeC8ZYVXYgh",
         },
     },
     .paths = .{
