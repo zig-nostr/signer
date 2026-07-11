@@ -72,7 +72,7 @@ fn decide(ctx: ?*anyopaque, request: *const nip46.Request) nip46.Decision {
 
 /// Parses the `kind` from a `sign_event` request's event template (params[0]),
 /// or null if it is missing or unparseable (the caller treats null as "deny").
-fn signEventKind(gpa: std.mem.Allocator, request: *const nip46.Request) ?u16 {
+pub fn signEventKind(gpa: std.mem.Allocator, request: *const nip46.Request) ?u16 {
     if (request.params.len < 1) return null;
     const parsed = std.json.parseFromSlice(
         struct { kind: u16 },

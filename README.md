@@ -11,7 +11,9 @@ native clients over a relay — the secret key never reaches the client.
 > roadmap. The current build loads an encrypted (NIP-49) key from disk, connects
 > to your relays, and answers NIP-46 requests — `get_public_key`, `sign_event`,
 > `ping`, and NIP-44 encrypt/decrypt — behind the connection secret and an
-> optional method/event-kind allowlist. A native approval UI is landing later.
+> optional method/event-kind allowlist. It can also run in **GUI mode**, holding
+> each request for interactive approval over a loopback API — the key never
+> leaves the daemon. The native approval app itself is landing next.
 
 ## Build
 
@@ -71,13 +73,37 @@ Two optional variables narrow that to least privilege:
 
 Denied requests are answered with a NIP-46 error and logged.
 
+### Interactive approval (GUI mode)
+
+By default a request that passes the allowlist is answered immediately. Set
+`SIGNER_APPROVAL_HTTP` to instead hold each one for interactive approval: the
+daemon serves a small **loopback-only** HTTP API that a separate GUI connects
+to, so you approve or deny each request on screen. The key never leaves the
+daemon — the GUI only ever sees request metadata and sends back a yes/no.
+
+```sh
+SIGNER_KEY_FILE="$HOME/.zig-nostr-signer.ncryptsec" \
+SIGNER_PASSPHRASE="a strong passphrase" \
+SIGNER_RELAYS="wss://relay.example.com" \
+SIGNER_APPROVAL_HTTP="127.0.0.1:8787" \
+SIGNER_APPROVAL_TOKEN_FILE="$HOME/.zig-nostr-signer.token" \
+  zig build run
+```
+
+The API is bound to loopback and every request must carry the bearer token
+written (mode `0600`) to `SIGNER_APPROVAL_TOKEN_FILE`. Endpoints: `GET /pending`
+(long-poll), `POST /decision`, `GET /info`. A request left unanswered past the
+timeout is denied, and the allowlist still applies first — so disallowed
+requests are rejected without ever prompting.
+
 ## Roadmap
 
 - [x] `bunker://` connection token from a key + relays
 - [x] Relay listen/sign loop (answer NIP-46 requests over a relay)
-- [ ] Encrypted key storage at rest (NIP-49 `ncryptsec`)
+- [x] Encrypted key storage at rest (NIP-49 `ncryptsec`)
 - [x] Per-request approval policy (method + event-kind allowlists)
-- [ ] Native macOS app + downloadable build
+- [x] Loopback approval API for interactive GUI approval
+- [ ] Native macOS approval app + downloadable build
 
 ## License
 
