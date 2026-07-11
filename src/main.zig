@@ -1,12 +1,15 @@
 //! zig-nostr signer — a headless NIP-46 remote signer ("bunker").
 //!
 //! Keeps the user's secret key on a machine they control and signs for remote
-//! clients over a relay. This early build derives the key and prints the
-//! `bunker://` connection token; the relay listen/sign loop, encrypted key
-//! storage (NIP-49), and the approval UX are the next slices — see README.
+//! clients over a relay. On startup it derives the keypair, prints the
+//! `bunker://` connection token, then connects to each configured relay and
+//! serves NIP-46 requests (see `serve.zig`) until stopped. Encrypted key
+//! storage (NIP-49) and a per-request approval UX are the next slices; this
+//! build auto-approves every request behind the connection secret.
 
 const std = @import("std");
 const nostr = @import("nostr");
+const serve = @import("serve.zig");
 
 const keys = nostr.keys;
 const nip46 = nostr.nip46;
@@ -18,9 +21,10 @@ const usage =
     \\Configure via environment variables:
     \\  SIGNER_SECRET_KEY      64-char hex secret key (required)
     \\  SIGNER_RELAYS          comma-separated wss:// relay URLs (required)
-    \\  SIGNER_CONNECT_SECRET  optional connection secret
+    \\  SIGNER_CONNECT_SECRET  optional connection secret clients must echo
     \\
-    \\Prints the signer's public key and the bunker:// token clients connect with.
+    \\Prints the signer's public key and the bunker:// token clients connect
+    \\with, then serves NIP-46 requests over the relays until stopped.
     \\
 ;
 
@@ -58,14 +62,75 @@ pub fn main() !void {
     defer gpa.free(pk_hex);
 
     std.debug.print(
-        \\zig-nostr signer (headless, work in progress)
+        \\zig-nostr signer (headless)
         \\  pubkey : {s}
         \\  bunker : {s}
         \\
-        \\The relay listen/sign loop is not wired up yet — this prints the
-        \\connection token so clients can be wired while it lands.
+        \\Share the bunker:// token with a client to connect. Requests are
+        \\auto-approved{s}. Press Ctrl-C to stop.
         \\
-    , .{ pk_hex, token });
+    , .{ pk_hex, token, if (conn_secret == null) " (no connection secret set)" else "" });
+
+    // Serve each relay on its own thread. Each thread owns its secp256k1
+    // context and bunker, so nothing mutable is shared between them; the only
+    // shared state is the read-only key material and the allocator.
+    var threads: std.ArrayList(std.Thread) = .empty;
+    defer threads.deinit(gpa);
+    for (relays.items) |url| {
+        const t = std.Thread.spawn(.{}, serveRelayForever, .{ gpa, url, secret_key, conn_secret }) catch |err| {
+            std.debug.print("signer: [{s}] could not start: {s}\n", .{ url, @errorName(err) });
+            continue;
+        };
+        try threads.append(gpa, t);
+    }
+    if (threads.items.len == 0) fail("could not start any relay connections");
+    for (threads.items) |t| t.join();
+}
+
+/// Connects to `url` and serves requests forever, reconnecting after a short
+/// delay whenever the connection drops. Runs on its own thread with its own
+/// signing context, derived from the shared read-only `secret_key`.
+fn serveRelayForever(
+    gpa: std.mem.Allocator,
+    url: []const u8,
+    secret_key: [32]u8,
+    conn_secret: ?[]const u8,
+) void {
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var signer = keys.Signer.init();
+    defer signer.deinit();
+    const kp = signer.keyPairFromSecretKey(secret_key) catch {
+        std.debug.print("signer: [{s}] invalid secret key\n", .{url});
+        return;
+    };
+
+    var bunker = nip46.Bunker.initSingleKey(signer, kp, nip46.approveAll());
+    bunker.secret = conn_secret;
+
+    while (true) {
+        serveOnce(gpa, io, url, bunker, kp) catch |err| {
+            std.debug.print("signer: [{s}] {s}\n", .{ url, @errorName(err) });
+        };
+        std.debug.print("signer: [{s}] disconnected; reconnecting in 3s\n", .{url});
+        io.sleep(std.Io.Duration.fromSeconds(3), .awake) catch {};
+    }
+}
+
+/// Dials `url`, then serves requests until the connection closes.
+fn serveOnce(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    url: []const u8,
+    bunker: nip46.Bunker,
+    remote: keys.KeyPair,
+) !void {
+    var relay = try nostr.relay.dial(gpa, io, url);
+    defer relay.deinit();
+    std.debug.print("signer: [{s}] connected; listening for NIP-46 requests\n", .{url});
+    try serve.serve(gpa, io, relay, bunker, remote);
 }
 
 fn getEnv(name: [*:0]const u8) ?[]const u8 {
@@ -76,6 +141,11 @@ fn getEnv(name: [*:0]const u8) ?[]const u8 {
 fn fail(message: []const u8) noreturn {
     std.debug.print("error: {s}\n\n{s}", .{ message, usage });
     std.process.exit(1);
+}
+
+test {
+    // Ensure the serve loop's hermetic tests run under `zig build test`.
+    _ = @import("serve.zig");
 }
 
 test "derives the pubkey and builds a bunker token" {
