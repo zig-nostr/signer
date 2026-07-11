@@ -8,10 +8,10 @@ It keeps your `nsec` on a machine you control and signs on behalf of web and
 native clients over a relay — the secret key never reaches the client.
 
 > **Status: early / work in progress.** This is Showcase 1 of the zig-nostr
-> roadmap. The current build connects to your relays and answers NIP-46
-> requests — `get_public_key`, `sign_event`, `ping`, and NIP-44
-> encrypt/decrypt — auto-approving each one behind the connection secret.
-> Encrypted key storage (NIP-49) and a real approval UX are landing next.
+> roadmap. The current build loads an encrypted (NIP-49) key from disk, connects
+> to your relays, and answers NIP-46 requests — `get_public_key`, `sign_event`,
+> `ping`, and NIP-44 encrypt/decrypt — auto-approving each one behind the
+> connection secret. A per-request approval UX is landing next.
 
 ## Build
 
@@ -23,19 +23,38 @@ zig build
 
 ## Usage
 
-Configure the signer with environment variables, then run it:
+The signer is configured with environment variables. First create an encrypted
+key file — it is stored `0600` as a NIP-49 `ncryptsec`, so your key is never on
+disk in the clear:
 
 ```sh
-SIGNER_SECRET_KEY=<64-char hex secret key> \
+# Generates a fresh key (or set SIGNER_SECRET_KEY to import an existing hex key),
+# encrypts it, writes the file, and exits.
+SIGNER_INIT=1 \
+SIGNER_KEY_FILE="$HOME/.zig-nostr-signer.ncryptsec" \
+SIGNER_PASSPHRASE="a strong passphrase" \
+  zig build run
+```
+
+Then start serving:
+
+```sh
+SIGNER_KEY_FILE="$HOME/.zig-nostr-signer.ncryptsec" \
+SIGNER_PASSPHRASE="a strong passphrase" \
 SIGNER_RELAYS="wss://relay.example.com,wss://relay.two" \
 SIGNER_CONNECT_SECRET=<optional connection secret> \
   zig build run
 ```
 
-It prints the signer's public key and the `bunker://` token a client uses to
-connect, then dials each relay and serves NIP-46 requests until stopped
-(reconnecting automatically if a relay drops). Paste the token into a
-NIP-46-capable client to sign with a key that never leaves this process.
+It decrypts the key once at startup, prints the signer's public key and the
+`bunker://` token a client uses to connect, then dials each relay and serves
+NIP-46 requests until stopped (reconnecting automatically if a relay drops).
+Paste the token into a NIP-46-capable client to sign with a key that never
+leaves this process.
+
+For quick local testing you can skip the key file and pass an unencrypted key
+directly with `SIGNER_SECRET_KEY=<64-char hex>` — but that keeps the key in your
+environment in the clear, so prefer the encrypted file otherwise.
 
 ## Roadmap
 

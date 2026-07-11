@@ -1,27 +1,39 @@
 //! zig-nostr signer — a headless NIP-46 remote signer ("bunker").
 //!
 //! Keeps the user's secret key on a machine they control and signs for remote
-//! clients over a relay. On startup it derives the keypair, prints the
-//! `bunker://` connection token, then connects to each configured relay and
-//! serves NIP-46 requests (see `serve.zig`) until stopped. Encrypted key
-//! storage (NIP-49) and a per-request approval UX are the next slices; this
-//! build auto-approves every request behind the connection secret.
+//! clients over a relay. On startup it loads the key — decrypting an encrypted
+//! NIP-49 key file at rest (see `keystore.zig`), or an unencrypted dev key —
+//! prints the `bunker://` connection token, then connects to each configured
+//! relay and serves NIP-46 requests (see `serve.zig`) until stopped. A
+//! per-request approval UX is the next slice; this build auto-approves every
+//! request behind the connection secret.
 
 const std = @import("std");
 const nostr = @import("nostr");
 const serve = @import("serve.zig");
+const keystore = @import("keystore.zig");
 
 const keys = nostr.keys;
 const nip46 = nostr.nip46;
+const nip49 = nostr.nip49;
 const hex = nostr.hex;
 
 const usage =
     \\zig-nostr signer — headless NIP-46 remote signer (bunker)
     \\
     \\Configure via environment variables:
-    \\  SIGNER_SECRET_KEY      64-char hex secret key (required)
-    \\  SIGNER_RELAYS          comma-separated wss:// relay URLs (required)
+    \\  SIGNER_KEY_FILE        path to an encrypted (NIP-49) key file
+    \\  SIGNER_PASSPHRASE      passphrase for the encrypted key file
+    \\  SIGNER_SECRET_KEY      64-char hex secret key (unencrypted; dev use only)
+    \\  SIGNER_RELAYS          comma-separated wss:// relay URLs (required to serve)
     \\  SIGNER_CONNECT_SECRET  optional connection secret clients must echo
+    \\  SIGNER_INIT            if set, create/import an encrypted key file and exit
+    \\
+    \\Provide the key either as an encrypted file (SIGNER_KEY_FILE +
+    \\SIGNER_PASSPHRASE, recommended) or as SIGNER_SECRET_KEY (dev only). To create
+    \\an encrypted file, run once with SIGNER_INIT set plus SIGNER_KEY_FILE and
+    \\SIGNER_PASSPHRASE — it imports SIGNER_SECRET_KEY if present, else generates a
+    \\fresh key — then run again without SIGNER_INIT to start serving.
     \\
     \\Prints the signer's public key and the bunker:// token clients connect
     \\with, then serves NIP-46 requests over the relays until stopped.
@@ -31,20 +43,24 @@ const usage =
 pub fn main() !void {
     const gpa = std.heap.page_allocator;
 
-    const secret_hex = getEnv("SIGNER_SECRET_KEY") orelse
-        fail("set SIGNER_SECRET_KEY to a 64-char hex secret key");
+    // `SIGNER_INIT` bootstraps an encrypted key file at rest, then exits.
+    if (getEnv("SIGNER_INIT") != null) runInit(gpa);
+
     const relays_env = getEnv("SIGNER_RELAYS") orelse
         fail("set SIGNER_RELAYS to a comma-separated list of wss:// URLs");
     const conn_secret = getEnv("SIGNER_CONNECT_SECRET");
 
-    const secret_key = hex.decodeFixed(32, secret_hex) catch
-        fail("SIGNER_SECRET_KEY must be exactly 64 hex characters");
+    // Load the secret key once (decrypting the at-rest key file if configured).
+    // The deliberately-expensive scrypt KDF runs here and only here; the relay
+    // threads below receive the already-derived 32-byte key, so no per-request
+    // or per-connection key derivation ever happens.
+    const secret_key = loadSecretKey(gpa);
 
     var signer = keys.Signer.init();
     defer signer.deinit();
 
     const kp = signer.keyPairFromSecretKey(secret_key) catch
-        fail("SIGNER_SECRET_KEY is not a valid secp256k1 secret key");
+        fail("the configured key is not a valid secp256k1 secret key");
 
     var relays: std.ArrayList([]const u8) = .empty;
     defer relays.deinit(gpa);
@@ -133,6 +149,91 @@ fn serveOnce(
     try serve.serve(gpa, io, relay, bunker, remote);
 }
 
+/// Resolves the signer's 32-byte secret key from the environment, preferring
+/// the encrypted-at-rest key file over the plaintext `SIGNER_SECRET_KEY`. The
+/// scrypt decryption cost is paid once, here, at startup.
+fn loadSecretKey(gpa: std.mem.Allocator) [32]u8 {
+    if (getEnv("SIGNER_KEY_FILE")) |path| {
+        const passphrase = getEnv("SIGNER_PASSPHRASE") orelse
+            fail("SIGNER_KEY_FILE is set but SIGNER_PASSPHRASE is not");
+
+        var startup = std.Io.Threaded.init(gpa, .{});
+        defer startup.deinit();
+        const io = startup.io();
+
+        const ncryptsec = keystore.readKeyFile(gpa, io, std.Io.Dir.cwd(), path) catch |err|
+            failFmt("could not read SIGNER_KEY_FILE '{s}': {s}", .{ path, @errorName(err) });
+        defer gpa.free(ncryptsec);
+
+        return keystore.decryptKey(gpa, ncryptsec, passphrase) catch
+            fail("could not decrypt the key file (wrong SIGNER_PASSPHRASE?)");
+    }
+
+    if (getEnv("SIGNER_SECRET_KEY")) |secret_hex| {
+        std.debug.print(
+            \\warning: SIGNER_SECRET_KEY keeps your key UNENCRYPTED in the environment.
+            \\         Prefer an encrypted key file: run once with SIGNER_INIT set plus
+            \\         SIGNER_KEY_FILE + SIGNER_PASSPHRASE, then drop SIGNER_SECRET_KEY.
+            \\
+        , .{});
+        return hex.decodeFixed(32, secret_hex) catch
+            fail("SIGNER_SECRET_KEY must be exactly 64 hex characters");
+    }
+
+    fail("set SIGNER_KEY_FILE (+ SIGNER_PASSPHRASE), or SIGNER_SECRET_KEY (dev only)");
+}
+
+/// Creates the encrypted-at-rest key file and exits. Imports `SIGNER_SECRET_KEY`
+/// if present (marked known-insecure, since it was plaintext in the environment),
+/// otherwise generates a fresh key. Refuses to overwrite an existing file.
+fn runInit(gpa: std.mem.Allocator) noreturn {
+    const path = getEnv("SIGNER_KEY_FILE") orelse
+        fail("SIGNER_INIT requires SIGNER_KEY_FILE (path to write the encrypted key to)");
+    const passphrase = getEnv("SIGNER_PASSPHRASE") orelse
+        fail("SIGNER_INIT requires SIGNER_PASSPHRASE (to encrypt the key with)");
+
+    var startup = std.Io.Threaded.init(gpa, .{});
+    defer startup.deinit();
+    const io = startup.io();
+
+    var signer = keys.Signer.init();
+    defer signer.deinit();
+
+    var security: nip49.KeySecurity = .known_secure;
+    const kp = if (getEnv("SIGNER_SECRET_KEY")) |secret_hex| blk: {
+        const secret_key = hex.decodeFixed(32, secret_hex) catch
+            fail("SIGNER_SECRET_KEY must be exactly 64 hex characters");
+        security = .known_insecure; // it sat in the environment as plaintext
+        break :blk signer.keyPairFromSecretKey(secret_key) catch
+            fail("SIGNER_SECRET_KEY is not a valid secp256k1 secret key");
+    } else signer.generateKeyPair(io) catch |err|
+        failFmt("could not generate a key: {s}", .{@errorName(err)});
+
+    const ncryptsec = keystore.encryptKey(gpa, io, kp.secret_key, passphrase, security) catch |err|
+        failFmt("could not encrypt the key: {s}", .{@errorName(err)});
+    defer gpa.free(ncryptsec);
+
+    keystore.writeNewKeyFile(io, std.Io.Dir.cwd(), path, ncryptsec) catch |err| switch (err) {
+        keystore.Error.KeyFileExists => failFmt("SIGNER_KEY_FILE '{s}' already exists; refusing to overwrite", .{path}),
+        else => failFmt("could not write '{s}': {s}", .{ path, @errorName(err) }),
+    };
+
+    const pk_hex = hex.encode(gpa, &kp.public_key) catch |err|
+        failFmt("could not encode the public key: {s}", .{@errorName(err)});
+    defer gpa.free(pk_hex);
+
+    std.debug.print(
+        \\Initialized encrypted signer key.
+        \\  pubkey : {s}
+        \\  file   : {s}  (mode 0600, NIP-49 ncryptsec)
+        \\
+        \\To start serving, unset SIGNER_INIT and run again with SIGNER_KEY_FILE,
+        \\SIGNER_PASSPHRASE and SIGNER_RELAYS set.
+        \\
+    , .{ pk_hex, path });
+    std.process.exit(0);
+}
+
 fn getEnv(name: [*:0]const u8) ?[]const u8 {
     const value = std.c.getenv(name) orelse return null;
     return std.mem.span(value);
@@ -143,9 +244,18 @@ fn fail(message: []const u8) noreturn {
     std.process.exit(1);
 }
 
+fn failFmt(comptime fmt: []const u8, args: anytype) noreturn {
+    std.debug.print("error: ", .{});
+    std.debug.print(fmt, args);
+    std.debug.print("\n\n{s}", .{usage});
+    std.process.exit(1);
+}
+
 test {
-    // Ensure the serve loop's hermetic tests run under `zig build test`.
+    // Ensure the serve loop's and keystore's hermetic tests run under
+    // `zig build test`.
     _ = @import("serve.zig");
+    _ = @import("keystore.zig");
 }
 
 test "derives the pubkey and builds a bunker token" {
