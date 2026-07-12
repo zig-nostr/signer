@@ -10,6 +10,12 @@ signing requests from your [signer daemon](../daemon).
 > the daemon itself. `scripts/package-macos.sh` bundles both into a single
 > `.app`; a signed, notarized distributable is next.
 
+![Signer Approvals: first-run key setup, then approving a live signing request](assets/demo.gif)
+
+<sub>First-run key setup (create a new key, or import an existing `nsec`), then
+approving a live NIP-46 signing request from a connected client. The key is
+generated and held by the signer daemon — it never enters this app.</sub>
+
 ## Architecture
 
 The signer is split into two processes on purpose:
