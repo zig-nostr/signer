@@ -17,6 +17,7 @@ const nostr = @import("nostr");
 
 const keys = nostr.keys;
 const nip46 = nostr.nip46;
+const nip42 = nostr.nip42;
 const hex = nostr.hex;
 const Event = nostr.event.Event;
 const Filter = nostr.filter.Filter;
@@ -41,6 +42,7 @@ pub fn serve(
     conn: anytype,
     bunker: nip46.Bunker,
     remote: keys.KeyPair,
+    relay_url: []const u8,
 ) !void {
     const my_pubkey_hex = try hex.encode(gpa, &remote.public_key);
     defer gpa.free(my_pubkey_hex);
@@ -54,6 +56,13 @@ pub fn serve(
     const filters = [_]Filter{.{ .kinds = &kinds, .tags = &tag_filters, .since = since }};
     try conn.subscribe(subscription_id, &filters);
 
+    // NIP-42: relays that require authentication challenge us before delivering
+    // ephemeral events (and reject our publishes). We answer each challenge by
+    // signing a kind:22242 event; once the relay accepts it we (re)subscribe,
+    // since the initial REQ may have been closed pending auth. `auth_event_id`
+    // lets us recognize the OK for our own auth event.
+    var auth_event_id: ?[32]u8 = null;
+
     while (true) {
         var msg = (try conn.receive()) orelse break;
         defer msg.deinit();
@@ -62,15 +71,66 @@ pub fn serve(
                 std.debug.print("signer: dropped a request: {s}\n", .{@errorName(err)});
             },
             .eose => {},
+            .auth => |a| {
+                if (authenticate(gpa, io, conn, bunker.signer, remote, relay_url, a.challenge)) |id| {
+                    auth_event_id = id;
+                    std.debug.print("signer: [{s}] answering NIP-42 auth challenge\n", .{relay_url});
+                } else |err| {
+                    std.debug.print("signer: [{s}] NIP-42 auth failed: {s}\n", .{ relay_url, @errorName(err) });
+                }
+            },
             .closed => |c| {
-                std.debug.print("signer: relay closed the subscription: {s}\n", .{c.message});
-                return;
+                // "auth-required" is not a real close: the relay is gating the
+                // subscription behind NIP-42. We re-subscribe once the auth event
+                // is accepted (below), so note it and keep the connection open.
+                if (std.mem.startsWith(u8, c.message, "auth-required")) {
+                    std.debug.print("signer: [{s}] auth required for the subscription\n", .{relay_url});
+                } else {
+                    std.debug.print("signer: relay closed the subscription: {s}\n", .{c.message});
+                    return;
+                }
+            },
+            .ok => |o| {
+                // OK acks our publications. When the relay accepts our auth
+                // event, (re)subscribe now that the connection is authenticated;
+                // if it rejects it, surface why (a relay-URL or challenge
+                // mismatch, an expired timestamp, ...).
+                if (auth_event_id) |aid| {
+                    if (std.mem.eql(u8, &o.event_id, &aid)) {
+                        if (o.accepted) {
+                            conn.subscribe(subscription_id, &filters) catch |err| {
+                                std.debug.print("signer: [{s}] re-subscribe after auth failed: {s}\n", .{ relay_url, @errorName(err) });
+                            };
+                        } else {
+                            std.debug.print("signer: [{s}] relay rejected NIP-42 auth: {s}\n", .{ relay_url, o.message });
+                        }
+                        auth_event_id = null; // one attempt per challenge
+                    }
+                }
             },
             .notice => |n| std.debug.print("signer: relay notice: {s}\n", .{n.message}),
-            // OK acks our own reply publications; nothing to do.
-            .ok => {},
         }
     }
+}
+
+/// Signs and sends a NIP-42 authentication event answering `challenge` for
+/// `relay_url`, signed with the signer's communication key. Returns the event
+/// id so the serve loop can recognize the relay's OK for it.
+fn authenticate(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    conn: anytype,
+    signer: keys.Signer,
+    remote: keys.KeyPair,
+    relay_url: []const u8,
+    challenge: []const u8,
+) ![32]u8 {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const created_at = std.Io.Timestamp.now(io, .real).toSeconds();
+    const ev = try nip42.authEvent(arena.allocator(), signer, remote, relay_url, challenge, created_at, null);
+    try conn.authenticate(ev);
+    return ev.id;
 }
 
 /// Decrypts one kind:24133 request event addressed to us, runs it through the
@@ -215,7 +275,7 @@ const Harness = struct {
         defer conn.deinit();
 
         const bunker = nip46.Bunker.initSingleKey(self.signer_ctx, self.signer_kp, nip46.approveAll());
-        try serve(gpa, io, &conn, bunker, self.signer_kp);
+        try serve(gpa, io, &conn, bunker, self.signer_kp, "wss://relay.test");
 
         // The loop wrote a REQ then an EVENT; find the published EVENT frame and
         // decrypt its content with the client key.
@@ -325,7 +385,7 @@ test "serve rejects a request when the policy denies it" {
     defer conn.deinit();
 
     const bunker = nip46.Bunker.initSingleKey(h.signer_ctx, h.signer_kp, denyAll());
-    try serve(gpa, io, &conn, bunker, h.signer_kp);
+    try serve(gpa, io, &conn, bunker, h.signer_kp, "wss://relay.test");
 
     const reply_event_json = try findPublishedEvent(gpa, written.items);
     defer gpa.free(reply_event_json);
@@ -346,4 +406,72 @@ fn denyAllFn(_: ?*anyopaque, _: *const nip46.Request) nip46.Decision {
 
 fn denyAll() nip46.Policy {
     return .{ .decideFn = &denyAllFn };
+}
+
+test "serve answers a NIP-42 challenge and keeps serving past auth-required" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var h = try Harness.init();
+    defer h.deinit();
+
+    // A sealed sign_event request the relay delivers AFTER the auth dance.
+    const template = "{\"kind\":1,\"content\":\"hi\",\"tags\":[],\"created_at\":1700000000}";
+    const params = [_][]const u8{template};
+    const req_json = try (nip46.Request{ .id = "auth-1", .method = "sign_event", .params = &params }).toJson(gpa);
+    defer gpa.free(req_json);
+    var sealed_req = try nip46.seal(gpa, io, h.client_ctx, h.client_kp, h.signer_kp.public_key, req_json, 1_700_000_000);
+    defer sealed_req.deinit();
+    const req_event_json = try nostr.event.toJson(gpa, sealed_req.event);
+    defer gpa.free(req_event_json);
+    const event_msg = try std.fmt.allocPrint(gpa, "[\"EVENT\",\"{s}\",{s}]", .{ subscription_id, req_event_json });
+    defer gpa.free(event_msg);
+
+    // Script: the relay challenges (NIP-42), closes the sub as auth-required,
+    // then delivers the request (as it would once we're authenticated).
+    var script: std.ArrayList(u8) = .empty;
+    defer script.deinit(gpa);
+    try appendServerText(&script, gpa, "[\"AUTH\",\"chal-1\"]");
+    try appendServerText(&script, gpa, "[\"CLOSED\",\"" ++ subscription_id ++ "\",\"auth-required: authenticate first\"]");
+    try appendServerText(&script, gpa, event_msg);
+
+    var written: std.ArrayList(u8) = .empty;
+    defer written.deinit(gpa);
+    var stream = FakeStream{ .to_read = script.items, .written = &written, .allocator = gpa };
+    var conn = nostr.relay.Connection(*FakeStream).init(gpa, io, &stream);
+    defer conn.deinit();
+
+    const bunker = nip46.Bunker.initSingleKey(h.signer_ctx, h.signer_kp, nip46.approveAll());
+    try serve(gpa, io, &conn, bunker, h.signer_kp, "wss://relay.test");
+
+    // Walk the client frames once: it must have written a kind:22242 AUTH reply
+    // to the challenge, AND (not aborting on auth-required) a sealed response to
+    // the request that followed.
+    var authed = false;
+    var reply_json: ?[]u8 = null;
+    defer if (reply_json) |r| gpa.free(r);
+    var offset: usize = 0;
+    while (try nostr.websocket.decodeFrame(written.items[offset..])) |frame| {
+        offset += frame.frame_len;
+        if (std.mem.startsWith(u8, frame.payload, "[\"AUTH\",")) {
+            try testing.expect(std.mem.indexOf(u8, frame.payload, "\"kind\":22242") != null);
+            try testing.expect(std.mem.indexOf(u8, frame.payload, "wss://relay.test") != null);
+            try testing.expect(std.mem.indexOf(u8, frame.payload, "chal-1") != null);
+            authed = true;
+        } else if (std.mem.startsWith(u8, frame.payload, "[\"EVENT\",") and reply_json == null) {
+            reply_json = try gpa.dupe(u8, frame.payload["[\"EVENT\",".len .. frame.payload.len - 1]);
+        }
+    }
+    try testing.expect(authed);
+
+    var reply_event = try nostr.event.fromJson(gpa, reply_json orelse return error.NoReply);
+    defer reply_event.deinit();
+    const reply = try nip46.open(gpa, h.client_ctx, h.client_kp.secret_key, reply_event.value);
+    defer gpa.free(reply);
+    var parsed = try nip46.parseResponse(gpa, reply);
+    defer parsed.deinit();
+    try testing.expectEqualStrings("auth-1", parsed.value.id);
+    try testing.expectEqualStrings("", parsed.value.err);
 }
