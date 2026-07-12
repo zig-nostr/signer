@@ -22,6 +22,20 @@
     </column>
     <separator/>
   </if>
+  <if test="{show_relays}">
+    <column gap="6" padding="16">
+      <text foreground="text_muted">Relays</text>
+      <for each="relay_list" key="id" as="rl">
+        <row gap="8" cross="center">
+          <text grow="1" wrap="true">{rl.url}</text>
+          <if test="{rl.connected}"><text foreground="success">connected</text></if>
+          <if test="{rl.connecting}"><text foreground="text_muted">connecting…</text></if>
+          <if test="{rl.offline}"><text foreground="destructive">offline</text></if>
+        </row>
+      </for>
+    </column>
+    <separator/>
+  </if>
   <if test="{daemon_down}">
     <column gap="12" main="center" cross="center" grow="1" padding="24">
       <text>{exit_note}</text>

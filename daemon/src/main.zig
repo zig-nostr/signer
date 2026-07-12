@@ -102,7 +102,7 @@ pub fn main(init: std.process.Init) !void {
     // threads receive the already-derived 32-byte key, so no per-request or
     // per-connection key derivation ever happens.
     const secret_key = loadSecretKey(gpa);
-    runRelays(gpa, relays.items, secret_key, conn_secret, &policy_config, null);
+    runRelays(gpa, relays.items, secret_key, conn_secret, &policy_config, null, null);
 }
 
 /// GUI mode: stand up the approval API (key-less if there is no key yet), run
@@ -139,13 +139,20 @@ fn runGuiMode(gpa: std.mem.Allocator, addr: []const u8, conn_secret: ?[]const u8
     if (guiPreloadKey(gpa, io, key_file)) |kp| gate.preload(kp);
     const booted = gate.current();
 
+    // Live per-relay connection status, shared with the approval server's
+    // /info. Starts "connecting"; each relay thread flips its slot once it
+    // dials or drops. Lives for the process (main never returns).
+    const relay_status = gpa.alloc(std.atomic.Value(u8), relays.items.len) catch
+        fail("out of memory tracking relay status");
+    for (relay_status) |*s| s.* = std.atomic.Value(u8).init(@intFromEnum(approval_http.RelayStatus.connecting));
+
     const token_hex = makeAndWriteToken(gpa, token_path);
     var approval_server: approval_http.Server = .{
         .gpa = gpa,
         .broker = &broker_storage,
         .gate = &gate,
         .token = token_hex,
-        .info = .{ .relays = relays.items, .timeout_ms = broker_storage.timeout_ms, .secret = conn_secret },
+        .info = .{ .relays = relays.items, .timeout_ms = broker_storage.timeout_ms, .secret = conn_secret, .relay_status = relay_status },
         .host = hp.host,
         .port = hp.port,
     };
@@ -172,7 +179,7 @@ fn runGuiMode(gpa: std.mem.Allocator, addr: []const u8, conn_secret: ?[]const u8
     // preconfigured key was loaded above), then serve with it. The broker is
     // already live, so approvals work the moment serving starts.
     const secret_key = gate.waitUnlocked(io);
-    runRelays(gpa, relays.items, secret_key, conn_secret, policy_config, &broker_storage);
+    runRelays(gpa, relays.items, secret_key, conn_secret, policy_config, &broker_storage, relay_status);
 }
 
 /// Derives the keypair, prints the connection banner, and serves every relay on
@@ -186,6 +193,7 @@ fn runRelays(
     conn_secret: ?[]const u8,
     policy_config: *const policy.Config,
     broker: ?*approval.Broker,
+    relay_status: ?[]std.atomic.Value(u8),
 ) noreturn {
     var signer = keys.Signer.init();
     defer signer.deinit();
@@ -216,9 +224,11 @@ fn runRelays(
     gpa.free(pk_hex);
 
     var threads: std.ArrayList(std.Thread) = .empty;
-    for (relays) |url| {
-        const t = std.Thread.spawn(.{}, serveRelayForever, .{ gpa, url, secret_key, conn_secret, policy_config, broker }) catch |err| {
+    for (relays, 0..) |url, i| {
+        const slot: ?*std.atomic.Value(u8) = if (relay_status) |rs| &rs[i] else null;
+        const t = std.Thread.spawn(.{}, serveRelayForever, .{ gpa, url, secret_key, conn_secret, policy_config, broker, slot }) catch |err| {
             std.debug.print("signer: [{s}] could not start: {s}\n", .{ url, @errorName(err) });
+            if (slot) |s| s.store(@intFromEnum(approval_http.RelayStatus.disconnected), .monotonic);
             continue;
         };
         threads.append(gpa, t) catch fail("out of memory tracking relay threads");
@@ -288,6 +298,7 @@ fn serveRelayForever(
     conn_secret: ?[]const u8,
     policy_config: *const policy.Config,
     broker: ?*approval.Broker,
+    status: ?*std.atomic.Value(u8),
 ) void {
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -316,9 +327,11 @@ fn serveRelayForever(
     bunker.secret = conn_secret;
 
     while (true) {
-        serveOnce(gpa, io, url, bunker, kp) catch |err| {
+        if (status) |s| s.store(@intFromEnum(approval_http.RelayStatus.connecting), .monotonic);
+        serveOnce(gpa, io, url, bunker, kp, status) catch |err| {
             std.debug.print("signer: [{s}] {s}\n", .{ url, @errorName(err) });
         };
+        if (status) |s| s.store(@intFromEnum(approval_http.RelayStatus.disconnected), .monotonic);
         std.debug.print("signer: [{s}] disconnected; reconnecting in 3s\n", .{url});
         io.sleep(std.Io.Duration.fromSeconds(3), .awake) catch {};
     }
@@ -331,9 +344,11 @@ fn serveOnce(
     url: []const u8,
     bunker: nip46.Bunker,
     remote: keys.KeyPair,
+    status: ?*std.atomic.Value(u8),
 ) !void {
     var relay = try nostr.relay.dial(gpa, io, url);
     defer relay.deinit();
+    if (status) |s| s.store(@intFromEnum(approval_http.RelayStatus.connected), .monotonic);
     std.debug.print("signer: [{s}] connected; listening for NIP-46 requests\n", .{url});
     try serve.serve(gpa, io, relay, bunker, remote, url);
 }
