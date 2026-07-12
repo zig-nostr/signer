@@ -11,6 +11,12 @@ Built on [`zig-nostr/nostr`](https://github.com/zig-nostr/nostr).
 > relays; the native approval GUI and a signed, notarized distributable are in
 > progress.
 
+![Signet: first-run key setup, then approving a live signing request](gui/assets/demo.gif)
+
+<sub>First-run key setup (create a new key, or import an existing `nsec`), then
+approving a live NIP-46 signing request from a connected client. The key is
+generated and held by the signer daemon — it never enters the GUI.</sub>
+
 ## Two components, one product
 
 Signet is split into two processes on purpose, so the secret key stays isolated
