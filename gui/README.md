@@ -8,7 +8,8 @@ signing requests from your [signer daemon](../daemon).
 > or import), unlocks the key on later launches, then shows each pending signing
 > request and sends back your approve/deny decision — and spawns and supervises
 > the daemon itself. `scripts/package-macos.sh` bundles both into a single
-> `.app`; a signed, notarized distributable is next.
+> `.app`, shipped as ad-hoc-signed macOS releases (not notarized — see the
+> top-level [Download](../README.md#download)).
 
 ![Signet: first-run key setup, then approving a live signing request](assets/demo.gif)
 
@@ -116,9 +117,16 @@ The daemon comes from the [`daemon/`](../daemon) package in this repo; build it
 (`cd ../daemon && zig build -Doptimize=ReleaseFast`) and the script finds
 `../daemon/zig-out/bin/signer` on its own, or pass `--signer <path>`.
 
-Ad-hoc signing (the default) is enough to run the bundle locally. A
-distributable, Gatekeeper-friendly build additionally needs a Developer ID and
-notarization, which require your own Apple credentials:
+Ad-hoc signing (the default) is what releases ship: the release workflow
+([`.github/workflows/release.yml`](../.github/workflows/release.yml)) runs this
+on every version tag and attaches the zipped `.app`. Ad-hoc bundles aren't
+notarized, so macOS Gatekeeper quarantines the download — see
+[**Download**](../README.md#download) in the top-level README for the one-line
+`xattr` step to open it.
+
+Notarizing is deliberately out of scope (a WIP key-holder gains little over a
+build you can reproduce yourself), but the Developer-ID path is still available
+if you want a Gatekeeper-friendly build with your own Apple credentials:
 
 ```sh
 scripts/package-macos.sh --signing identity \
@@ -132,7 +140,7 @@ scripts/package-macos.sh --signing identity \
 - [x] Supervise the daemon as a child process (one launch, key stays isolated)
 - [x] Bundle the daemon into the app — one `.app`, discovered and supervised
 - [x] First-run key onboarding in-app (create / import / unlock)
-- [ ] Signed, notarized distributable (Developer ID)
+- [x] Ad-hoc signed macOS releases (CI on tag; open past Gatekeeper with one `xattr`)
 
 ## License
 
