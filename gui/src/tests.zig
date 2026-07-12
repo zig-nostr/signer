@@ -86,6 +86,31 @@ test "the copy confirmation resets only when the bunker URI changes" {
     try testing.expectEqualStrings("Copy", m.copy_label());
 }
 
+test "parseInfo reads the relay list with per-relay status" {
+    var m = Model{};
+    m.phase = .connected;
+    main.parseInfo(&m, "{\"state\":\"unlocked\",\"relays\":[" ++
+        "{\"url\":\"wss://a.example\",\"status\":\"connected\"}," ++
+        "{\"url\":\"wss://b.example\",\"status\":\"connecting\"}," ++
+        "{\"url\":\"wss://c.example\",\"status\":\"disconnected\"}]}");
+
+    const list = m.relay_list(testing.allocator); // arena arg is unused
+    try testing.expectEqual(@as(usize, 3), list.len);
+    try testing.expectEqualStrings("wss://a.example", list[0].url());
+    try testing.expectEqual(main.RelayConn.connected, list[0].conn);
+    try testing.expectEqualStrings("connected", list[0].status_label());
+    try testing.expect(list[0].connected());
+    try testing.expectEqual(main.RelayConn.connecting, list[1].conn);
+    try testing.expect(list[1].connecting());
+    try testing.expectEqual(main.RelayConn.disconnected, list[2].conn);
+    try testing.expect(list[2].offline());
+
+    // Listed only while serving.
+    try testing.expect(m.show_relays());
+    m.phase = .starting;
+    try testing.expect(!m.show_relays());
+}
+
 test "parsePending loads the queue with kinds and formatted labels" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();

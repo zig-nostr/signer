@@ -4,7 +4,7 @@
 //! Deliberately tiny (fixed routes, no keep-alive, no chunked encoding) to keep
 //! the key-holding daemon's attack surface small:
 //!
-//!   GET  /info              {"state":..,"pubkey":..,"bunker":..,"relays":[..],"timeout_ms":N}
+//!   GET  /info              {"state":..,"pubkey":..,"bunker":..,"relays":[{"url":..,"status":..}],"timeout_ms":N}
 //!   POST /setup             {"passphrase":..,"secret":..?} → create/import a key
 //!   POST /unlock            {"passphrase":..} → decrypt the key file
 //!   GET  /pending?since=N   long-poll (~1s) → {"version":N,"pending":[...]}
@@ -30,12 +30,18 @@ const Broker = approval.Broker;
 const Pending = approval.Pending;
 const Gate = onboarding.Gate;
 
+/// Live connection state of one relay, reported per relay on `/info`.
+pub const RelayStatus = enum(u8) { connecting, connected, disconnected };
+
 pub const Info = struct {
     relays: []const []const u8,
     timeout_ms: u64,
     /// Optional connection secret clients must echo; folded into the `bunker://`
     /// URI reported on `/info`. Null in the turnkey case.
     secret: ?[]const u8 = null,
+    /// Live per-relay status, parallel to `relays` (the relay threads update it,
+    /// `/info` reads it). Null in headless mode, where nothing serves `/info`.
+    relay_status: ?[]std.atomic.Value(u8) = null,
 };
 
 pub const Server = struct {
@@ -235,7 +241,11 @@ fn handleInfo(self: *Server, w: *std.Io.Writer) !void {
     try json.appendSlice(self.gpa, head);
     for (self.info.relays, 0..) |relay, i| {
         if (i != 0) try json.append(self.gpa, ',');
-        const item = try std.fmt.allocPrint(self.gpa, "\"{s}\"", .{relay}); // relay URLs carry no JSON metacharacters
+        // Report each relay's live connection status (or "connecting" before the
+        // threads have started / in a caller that tracks none). Relay URLs carry
+        // no JSON metacharacters.
+        const st: RelayStatus = if (self.info.relay_status) |rs| @enumFromInt(rs[i].load(.monotonic)) else .connecting;
+        const item = try std.fmt.allocPrint(self.gpa, "{{\"url\":\"{s}\",\"status\":\"{s}\"}}", .{ relay, @tagName(st) });
         defer self.gpa.free(item);
         try json.appendSlice(self.gpa, item);
     }
@@ -425,4 +435,34 @@ test "GET /info omits the bunker URI until the key is unlocked" {
 
     try testing.expect(std.mem.indexOf(u8, body.items, "\"state\":\"uninitialized\"") != null);
     try testing.expect(std.mem.indexOf(u8, body.items, "\"bunker\":\"\"") != null);
+}
+
+test "GET /info reports live per-relay connection status" {
+    const gpa = testing.allocator;
+
+    var gate = Gate.init(gpa, std.Io.Dir.cwd(), "unused.ncryptsec", .uninitialized);
+    var broker: Broker = .{};
+    const relays = [_][]const u8{ "wss://a.example", "wss://b.example" };
+    var status = [_]std.atomic.Value(u8){
+        std.atomic.Value(u8).init(@intFromEnum(RelayStatus.connected)),
+        std.atomic.Value(u8).init(@intFromEnum(RelayStatus.disconnected)),
+    };
+    var server = Server{
+        .gpa = gpa,
+        .broker = &broker,
+        .gate = &gate,
+        .token = "t",
+        .info = .{ .relays = &relays, .timeout_ms = 0, .relay_status = &status },
+        .host = "127.0.0.1",
+        .port = 0,
+    };
+
+    var out = std.Io.Writer.Allocating.init(gpa);
+    defer out.deinit();
+    try handleInfo(&server, &out.writer);
+    var body = out.toArrayList();
+    defer body.deinit(gpa);
+
+    try testing.expect(std.mem.indexOf(u8, body.items, "{\"url\":\"wss://a.example\",\"status\":\"connected\"}") != null);
+    try testing.expect(std.mem.indexOf(u8, body.items, "{\"url\":\"wss://b.example\",\"status\":\"disconnected\"}") != null);
 }

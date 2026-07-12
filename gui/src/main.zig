@@ -69,10 +69,12 @@ const pending_key: u64 = 4;
 const setup_key: u64 = 5;
 const unlock_key: u64 = 6;
 const clipboard_key: u64 = 7;
+const info_refresh_key: u64 = 16; // periodic /info re-poll (distinct from the initial info_key)
 const decision_key_base: u64 = 8;
 const decision_key_slots: u64 = 8;
 const retry_timer_key: u64 = 100;
 const copy_reset_timer_key: u64 = 101;
+const info_refresh_timer_key: u64 = 102;
 
 fn decisionKey(id: u64) u64 {
     return decision_key_base + (id % decision_key_slots);
@@ -108,6 +110,41 @@ pub const Row = struct {
             return std.fmt.allocPrint(arena, "{s} · kind {d}", .{ self.method(), self.kind }) catch self.method();
         }
         return self.method();
+    }
+};
+
+pub const max_relays = 8;
+
+/// Live connection state of one relay, as reported by `/info`.
+pub const RelayConn = enum { connecting, connected, disconnected };
+
+/// One configured relay and its live status, listed on the serving screen.
+pub const RelayRow = struct {
+    id: usize = 0,
+    url_buf: [96]u8 = [_]u8{0} ** 96,
+    url_len: usize = 0,
+    conn: RelayConn = .connecting,
+
+    pub fn url(self: *const RelayRow) []const u8 {
+        return self.url_buf[0..self.url_len];
+    }
+    pub fn status_label(self: *const RelayRow) []const u8 {
+        return switch (self.conn) {
+            .connecting => "connecting…",
+            .connected => "connected",
+            .disconnected => "offline",
+        };
+    }
+    // Status predicates — the view picks a literally-colored status word off
+    // these (`foreground` takes only a literal token, so the color can't bind).
+    pub fn connected(self: *const RelayRow) bool {
+        return self.conn == .connected;
+    }
+    pub fn connecting(self: *const RelayRow) bool {
+        return self.conn == .connecting;
+    }
+    pub fn offline(self: *const RelayRow) bool {
+        return self.conn == .disconnected;
     }
 };
 
@@ -163,6 +200,10 @@ pub const Model = struct {
     /// True briefly after the Copy button writes the URI to the clipboard, so the
     /// button can confirm with "Copied!". Reset by a short one-shot timer.
     copied: bool = false,
+    /// The signer's relays and their live connection status, from `/info`; listed
+    /// on the serving screen so the user can see the signer is actually online.
+    relays: [max_relays]RelayRow = [_]RelayRow{.{}} ** max_relays,
+    relays_len: usize = 0,
     /// Short human note for the `.daemon_exited` state, e.g. "signer exited
     /// (code 1)".
     exit_note_buf: [64]u8 = [_]u8{0} ** 64,
@@ -384,6 +425,41 @@ pub const Model = struct {
         self.copied = false;
     }
 
+    /// The relay list, iterated by `<for each="relay_list">`.
+    pub fn relay_list(self: *const Model, arena: std.mem.Allocator) []const RelayRow {
+        _ = arena;
+        return self.relays[0..self.relays_len];
+    }
+    /// Show the relay list only while serving with relays in hand.
+    pub fn show_relays(self: *const Model) bool {
+        return self.phase == .connected and self.relays_len > 0;
+    }
+
+    /// Replaces the relay list from `/info`'s `relays` array of `{url,status}`.
+    /// Copies each URL into a fixed buffer (the parse arena is transient).
+    fn setRelays(self: *Model, list: anytype) void {
+        var n: usize = 0;
+        for (list) |r| {
+            if (n >= max_relays) break;
+            var row = RelayRow{ .id = n };
+            const un = @min(r.url.len, row.url_buf.len);
+            @memcpy(row.url_buf[0..un], r.url[0..un]);
+            row.url_len = un;
+            row.conn = if (std.mem.eql(u8, r.status, "connected"))
+                .connected
+            else if (std.mem.eql(u8, r.status, "disconnected"))
+                .disconnected
+            else
+                .connecting;
+            self.relays[n] = row;
+            n += 1;
+        }
+        self.relays_len = n;
+    }
+    fn clearRelays(self: *Model) void {
+        self.relays_len = 0;
+    }
+
     fn setExitNote(self: *Model, exit: native_sdk.EffectExit) void {
         const s = switch (exit.reason) {
             .spawn_failed, .rejected => std.fmt.bufPrint(&self.exit_note_buf, "The signer failed to start — check SIGNER_BIN.", .{}),
@@ -456,6 +532,10 @@ pub const Msg = union(enum) {
     bunker_copied: native_sdk.EffectClipboardResult,
     copy_reset: native_sdk.EffectTimer,
 
+    // Periodic /info re-poll (keeps the live relay status fresh) and its response.
+    refresh_tick: native_sdk.EffectTimer,
+    info_refresh: native_sdk.EffectResponse,
+
     // Onboarding (first-run key setup / unlock).
     passphrase_edit: canvas.TextInputEvent,
     secret_edit: canvas.TextInputEvent,
@@ -511,6 +591,24 @@ fn fetchInfo(model: *Model, fx: *Effects) void {
         .headers = &headers,
         .timeout_ms = 5_000,
         .on_response = Effects.responseMsg(.info),
+    });
+}
+
+/// A lightweight /info re-poll that only refreshes the live relay status (and the
+/// bunker URI), decoupled from the initial connect flow — its response never
+/// touches the phase or the pending-poll chain, and its failures are ignored (the
+/// pending poll is the real connection-health signal). Runs on its own effect key
+/// so it never collides with the initial `fetchInfo`.
+fn refreshInfo(model: *Model, fx: *Effects) void {
+    var buf: [128]u8 = undefined;
+    const url = std.fmt.bufPrint(&buf, "{s}/info", .{model.baseUrl()}) catch return;
+    const headers = [_]std.http.Header{.{ .name = "authorization", .value = model.auth() }};
+    fx.fetch(.{
+        .key = info_refresh_key,
+        .url = url,
+        .headers = &headers,
+        .timeout_ms = 5_000,
+        .on_response = Effects.responseMsg(.info_refresh),
     });
 }
 
@@ -627,6 +725,14 @@ pub fn boot(model: *Model, fx: *Effects) void {
         model.phase = .connecting;
     }
     attemptConnect(model, fx);
+    // Keep the live relay status fresh while serving (the initial /info is a
+    // one-shot; the pending poll doesn't carry relay state).
+    fx.startTimer(.{
+        .key = info_refresh_timer_key,
+        .interval_ms = 3_000,
+        .mode = .repeating,
+        .on_fire = Effects.timerMsg(.refresh_tick),
+    });
 }
 
 pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
@@ -642,6 +748,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.setAuth("");
             model.clearRows();
             model.clearBunker(); // the connection URI is stale once the daemon is gone
+            model.clearRelays();
             model.clearSecrets(); // don't keep a passphrase around a dead daemon
             model.clearOnboardError();
             model.submitting = false;
@@ -761,6 +868,18 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             if (t.outcome == .fired) model.copied = false;
         },
 
+        .refresh_tick => |t| {
+            // Re-poll /info only while serving and authenticated; otherwise the
+            // connect/retry flow owns /info.
+            if (t.outcome == .fired and model.phase == .connected and model.hasToken())
+                refreshInfo(model, fx);
+        },
+        .info_refresh => |r| {
+            // Live-status refresh only: update relay status (and bunker); never
+            // touch the phase or the pending-poll chain. Failures are ignored.
+            if (r.outcome == .ok and r.status == 200) parseInfo(model, r.body);
+        },
+
         // -- onboarding --
         .passphrase_edit => |e| model.passphrase_buf.apply(e),
         .secret_edit => |e| model.secret_buf.apply(e),
@@ -817,17 +936,25 @@ fn onOnboardResponse(model: *Model, fx: *Effects, r: native_sdk.EffectResponse, 
 // -------------------------------------------------------- response parsing
 
 /// Fills `model` from a `GET /info` body:
-/// `{"state":..,"pubkey":..,"bunker":..,"timeout_ms":..}`. `state` selects the
-/// screen (onboarding vs the queue); `bunker` is the connection URI shown while
-/// serving (empty until unlocked); malformed input is ignored.
+/// `{"state":..,"pubkey":..,"bunker":..,"relays":[{"url":..,"status":..}],"timeout_ms":..}`.
+/// `state` selects the screen (onboarding vs the queue); `bunker` is the
+/// connection URI shown while serving (empty until unlocked); `relays` carries
+/// each relay's live status; malformed input is ignored.
 pub fn parseInfo(model: *Model, body: []const u8) void {
-    var buf: [4096]u8 = undefined;
+    var buf: [8192]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&buf);
-    const Info = struct { state: []const u8 = "", pubkey: []const u8 = "", bunker: []const u8 = "", timeout_ms: u64 = 0 };
+    const Info = struct {
+        state: []const u8 = "",
+        pubkey: []const u8 = "",
+        bunker: []const u8 = "",
+        timeout_ms: u64 = 0,
+        relays: []const struct { url: []const u8 = "", status: []const u8 = "" } = &.{},
+    };
     const parsed = std.json.parseFromSliceLeaky(Info, fba.allocator(), body, .{ .ignore_unknown_fields = true }) catch return;
     model.setInfoState(parsed.state);
     model.setPubkey(parsed.pubkey);
     model.setBunker(parsed.bunker);
+    model.setRelays(parsed.relays);
     model.timeout_ms = parsed.timeout_ms;
 }
 
