@@ -321,7 +321,7 @@ fn serveOnce(
     var relay = try nostr.relay.dial(gpa, io, url);
     defer relay.deinit();
     std.debug.print("signer: [{s}] connected; listening for NIP-46 requests\n", .{url});
-    try serve.serve(gpa, io, relay, bunker, remote);
+    try serve.serve(gpa, io, relay, bunker, remote, url);
 }
 
 /// Resolves the signer's 32-byte secret key from the environment, preferring
